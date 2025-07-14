@@ -5,7 +5,9 @@ from langchain.prompts import PromptTemplate
 from services.embeddings import ollama_embeddings
 from services.llm import OllamaLLM
 from services.conversation_manager import conversation_manager
+from services.file_manager import file_manager
 from typing import List, Dict, Tuple
+import os
 
 vectorstore = Chroma(
     embedding_function=ollama_embeddings,
@@ -182,11 +184,22 @@ def get_chunk_statistics(chunks) -> Dict[str, any]:
         "total_length": sum(lengths)
     }
 
-def process_uploaded_files(files):
+def process_uploaded_files(files, cancellation_callback=None):
+    from services.file_manager import file_manager  # Import here to avoid circular import
     documents = []
     file_stats = []
     
     for file_info in files:
+        # Check if processing should be cancelled for this specific file
+        if cancellation_callback and not cancellation_callback(file_info['name']):
+            print(f"⚠️ Processing cancelled for {file_info['name']} - file removed")
+            continue
+            
+        # Check if file already exists in database
+        if file_manager.file_exists_in_database(file_info['name']):
+            print(f"⚠️ Skipping {file_info['name']} - already exists in database")
+            continue
+            
         file_path = file_info['path']
         file_ext = file_info['ext']
         
@@ -198,11 +211,45 @@ def process_uploaded_files(files):
             else:
                 continue
                 
+            # Check cancellation before loading
+            if cancellation_callback and not cancellation_callback(file_info['name']):
+                print(f"⚠️ Processing cancelled for {file_info['name']} - file removed before loading")
+                continue
+                
             docs = loader.load()
+            
+            # Check cancellation after loading
+            if cancellation_callback and not cancellation_callback(file_info['name']):
+                print(f"⚠️ Processing cancelled for {file_info['name']} - file removed during loading")
+                continue
+            
+            # Final check before processing to ensure no duplicates
+            if file_manager.file_exists_in_database(file_info['name']):
+                print(f"⚠️ Skipping {file_info['name']} - added to database during processing")
+                continue
+            
+            # Check cancellation before text splitting
+            if cancellation_callback and not cancellation_callback(file_info['name']):
+                print(f"⚠️ Processing cancelled for {file_info['name']} - file removed before text splitting")
+                continue
             
             # Use optimized text splitter based on document analysis
             optimized_splitter, chunk_size = get_optimized_text_splitter(docs)
             split_docs = optimized_splitter.split_documents(docs)
+            
+            # Check cancellation after text splitting
+            if cancellation_callback and not cancellation_callback(file_info['name']):
+                print(f"⚠️ Processing cancelled for {file_info['name']} - file removed after text splitting")
+                continue
+            
+            # Add filename metadata to all document chunks
+            for doc in split_docs:
+                doc.metadata['filename'] = file_info['name']
+            
+            # Final cancellation check before adding to documents
+            if cancellation_callback and not cancellation_callback(file_info['name']):
+                print(f"⚠️ Processing cancelled for {file_info['name']} - file removed before adding to vector store")
+                continue
             
             documents.extend(split_docs)
             
@@ -229,25 +276,50 @@ def process_uploaded_files(files):
             continue
     
     if documents:
-        try:
-            vectorstore.add_documents(documents)
+        # Final check before adding to vector store - remove documents for cancelled files
+        if cancellation_callback:
+            final_documents = []
             
-            # Print summary statistics
-            total_chunks = len(documents)
-            total_files = len(file_stats)
-            avg_chunks_per_file = total_chunks / total_files if total_files > 0 else 0
+            for doc in documents:
+                filename = doc.metadata.get('filename')
+                if filename and cancellation_callback(filename):
+                    final_documents.append(doc)
+                else:
+                    if filename:
+                        print(f"ℹ️ Filtering out chunks for cancelled file: {filename}")
             
-            print(f"\n📊 Processing Summary:")
-            print(f"   Files processed: {total_files}")
-            print(f"   Total chunks: {total_chunks}")
-            print(f"   Average chunks per file: {avg_chunks_per_file:.1f}")
-            print(f"✅ Successfully added to vector store")
+            # Filter file stats to match remaining documents
+            remaining_filenames = set(doc.metadata.get('filename') for doc in final_documents)
+            file_stats = [stat for stat in file_stats if stat['name'] in remaining_filenames]
             
+            documents = final_documents
+        
+        if documents:
+            try:
+                vectorstore.add_documents(documents)
+                
+                # Print summary statistics
+                total_chunks = len(documents)
+                total_files = len(file_stats)
+                avg_chunks_per_file = total_chunks / total_files if total_files > 0 else 0
+                
+                print(f"\n📊 Processing Summary:")
+                print(f"   Files processed: {total_files}")
+                print(f"   Total chunks added: {total_chunks}")
+                print(f"   Avg chunks per file: {avg_chunks_per_file:.2f}")
+                return True
+
+            except Exception as e:
+                print(f"❌ Error adding documents to vectorstore: {e}")
+                return False
+        else:
+            print("ℹ️ No documents to process after cancellation check")
             return True
-        except Exception as e:
-            print(f"❌ Error adding to vector store: {e}")
-            return False
     
+    if not file_stats:
+        print("ℹ️ No new files to process.")
+        return True
+
     return False
 
 retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
