@@ -61,6 +61,22 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# Vector databases and AI-specific files
+db/
+chroma_db/
+*.db
+*.sqlite
+*.sqlite3
+*.chroma
+temp/
+*.tmp
+*.temp
+
+# Document uploads and processing
+uploads/
+documents/
+processed_files/
+
 # Flask stuff:
 instance/
 .webassets-cache
